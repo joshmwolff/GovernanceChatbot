@@ -5,7 +5,7 @@ import chromadb
 import hashlib
 
 # Load key from Streamlit Secrets
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+client = OpenAI(api_key=st.secrets["openai_api_key"])
 
 
 # ---------------------------
