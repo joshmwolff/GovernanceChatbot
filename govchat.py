@@ -1,67 +1,110 @@
 import streamlit as st
-from docx import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
 from openai import OpenAI
+from docx import Document
+import chromadb
+import hashlib
 
+# Load key from Streamlit Secrets
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# Set API key securely
-openai.api_key = st.secrets["openai_api_key"]
-doc_path = "DataGov.docx"
-        doc = docx.Document(doc_path)
 
 # ---------------------------
-# Load and parse the Word document
+# Load the Word document
 # ---------------------------
 @st.cache_resource
 def load_document():
-    doc = doc
-    full_text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-    return full_text
+    doc = Document("DataGov.docx")
+    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+    return text
+
 
 # ---------------------------
-# Create or load vector store
+# Simple text chunker
+# ---------------------------
+def chunk_text(text, chunk_size=1800, overlap=200):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+
+# ---------------------------
+# Build Chroma vectorstore
 # ---------------------------
 @st.cache_resource
-def build_vectorstore(text):
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2000,
-        chunk_overlap=300
-    )
-    chunks = text_splitter.split_text(text)
+def build_vectordb(text):
+    chroma_client = chromadb.PersistentClient(path="./vectorstore")
 
-embeddings = OpenAIEmbeddings(
-    openai_api_key=st.secrets["OPENAI_API_KEY"],
-    model="text-embedding-3-large"   # optional but recommended
-)
-    vectordb = Chroma.from_texts(
-        texts=chunks,
-        embedding=embeddings,
-        persist_directory="./vectorstore"
-    )
-    vectordb.persist()
-    return vectordb
+    # Create or load collection
+    try:
+        collection = chroma_client.create_collection(
+            name="datagov",
+            metadata={"hnsw:space": "cosine"}
+        )
+    except:
+        collection = chroma_client.get_collection("datagov")
+
+    # Only embed once
+    if collection.count() == 0:
+        chunks = chunk_text(text)
+
+        ids = []
+        docs = []
+        embeddings = []
+
+        for chunk in chunks:
+            cid = hashlib.md5(chunk.encode()).hexdigest()
+            ids.append(cid)
+            docs.append(chunk)
+
+            emb = client.embeddings.create(
+                model="text-embedding-3-large",
+                input=chunk
+            ).data[0].embedding
+
+            embeddings.append(emb)
+
+        collection.add(
+            ids=ids,
+            documents=docs,
+            embeddings=embeddings
+        )
+
+    return collection
+
 
 # ---------------------------
-# Retrieve and answer
+# Query & answer
 # ---------------------------
-def answer_query(query, vectordb):
-    docs = vectordb.similarity_search(query, k=4)
-    context = "\n\n".join([d.page_content for d in docs])
+def answer_query(query, collection):
+    # Embed question
+    q_emb = client.embeddings.create(
+        model="text-embedding-3-large",
+        input=query
+    ).data[0].embedding
+
+    # Retrieve chunks
+    results = collection.query(
+        query_embeddings=[q_emb],
+        n_results=8
+    )
+
+    docs = results["documents"][0]
+    context = "\n\n".join(docs)
 
     prompt = f"""
-You must answer strictly and only from the document text below.
+    You are a helpful assistant grounded ONLY in the following document excerpts:
 
-Document context:
------------------
-{context}
------------------
+    {context}
 
-User question: {query}
+    User question: {query}
 
-If the document does not contain the answer, say so.
-"""
+    If the document does not contain the answer, say:
+    "The document does not appear to include that information."
+    """
 
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -77,16 +120,16 @@ If the document does not contain the answer, say so.
 def main():
     st.title("Data Governance Starter Guide – Document Chat")
 
-    with st.spinner("Loading document and building embeddings..."):
+    with st.spinner("Loading and indexing document..."):
         text = load_document()
-        vectordb = build_vectorstore(text)
+        vectordb = build_vectordb(text)
 
-    user_query = st.text_input("Ask a question about the guide:")
+    query = st.text_input("Ask a question about the guide:")
 
-    if user_query:
+    if query:
         with st.spinner("Retrieving answer..."):
-            answer = answer_query(user_query, vectordb)
-        st.write("### Answer")
+            answer = answer_query(query, vectordb)
+        st.markdown("### Answer")
         st.write(answer)
 
 
